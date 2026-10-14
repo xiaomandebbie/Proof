@@ -14,6 +14,22 @@ import { sha256 } from './ledger.mjs';
 
 export { AGENT_STATE_USE_POLICY };
 
+// 「凭空追加一条 user 消息」时必须带的身份声明。
+//
+// 为什么需要它：provider 不接受 assistant 或 system 收尾，所以状态块在主动唤醒
+// 这类场景只能以 user 角色追加。但那不是 {{user}} 在说话。不说清楚的话，模型会把
+// 整条当成「这一轮用户说的话」，发现里面只有系统状态，于是推断「没有新消息、
+// 这轮是我的回合继续」，开始自己跟自己接话。
+//
+// 只在 appendTailUserContext 的 push 分支使用。尾部本来就是真实 user 消息时不加——
+// 那种情况状态跟在她正文后面，归属本来就清楚。
+// 也不进 extra：否则会被 ledger 当成 proofContext 存下来，日后 replay 贴到她
+// 真实消息的末尾，变成「以下不是 {{user}} 的发言」接在她自己的话后面。
+export const GATEWAY_ENVIRONMENT_ENVELOPE =
+  '[Proof 环境]\n以下不是 {{user}} 的发言。{{user}} 这一轮没有说话，这条消息由系统附上，'
+  + '承载的是你自己身体此刻的状态。不要把它当成对话内容来回应、复述或追问，'
+  + '也不要因为它的存在就认为该由你继续说话。';
+
 // ---------------- 通用小工具 ----------------
 
 /** 依计划从原始数组**完全移除**被隐藏的整组（真实 context filtering，不回填、不留占位；用户设计 §2/§4）。 */
@@ -98,8 +114,13 @@ function mergeSystemMessage(messages, blockText) {
 /**
  * DeepSeek 要求 system 位于对话前缀，不能在多轮历史中间再插 system。动态块
  * 因而追加到当前 user 正文末尾：开头 system 与既有历史保持逐字不变，缓存只在
- * 本轮这个原本就新增的尾部发生 miss。非 user 尾部（如 tool result）则追加一条
- * user 上下文消息，保持 provider 的角色顺序合法。
+ * 本轮这个原本就新增的尾部发生 miss。
+ *
+ * 尾部不是 user 时（主动唤醒收尾于 assistant、或 tool result 收尾），只能另起
+ * 一条 user 消息来承载状态。这条消息必须带 GATEWAY_ENVIRONMENT_ENVELOPE 自报
+ * 身份：它是环境，不是 {{user}} 开口。2026-10-14 踩的坑——不带声明时模型把整条
+ * 读成「这一轮用户说的话」，发现只有系统状态，于是判断「没有新消息、该我继续」，
+ * 自己跟自己接话。
  */
 function appendTailUserContext(messages, blockText) {
   if (!blockText) return messages;
@@ -108,9 +129,9 @@ function appendTailUserContext(messages, blockText) {
   const tail = out[tailIndex];
   if (tail?.role === 'user' && (typeof tail.content === 'string' || Array.isArray(tail.content))) {
     out[tailIndex] = { ...tail, content: appendText(tail.content, blockText) };
-  } else {
-    out.push({ role: 'user', content: blockText });
+    return out;
   }
+  out.push({ role: 'user', content: `${GATEWAY_ENVIRONMENT_ENVELOPE}\n\n${blockText}` });
   return out;
 }
 
@@ -287,5 +308,6 @@ export default {
   buildOpenAiChatBody,
   buildOpenAiResponsesBody,
   buildAnthropicBody,
-  openAiResponsesManaged
+  openAiResponsesManaged,
+  GATEWAY_ENVIRONMENT_ENVELOPE
 };
