@@ -29,9 +29,20 @@ Gateway token 只映射到服务端注册的一个 Agent identity。身份不由
 
 Gateway 每轮调用 `buildAgentTurnContext(engine, agentId, now)` 获取状态，不自行计算酒精、敏感度、断片、reset 或 revision。消息账本只保留指纹、时间与恢复发射标记，不保存聊天正文。
 
+## 注入位置
+
+动态 `[Proof 状态]` 追加在本轮输入末尾，以尽量保持 system 与既有历史前缀稳定。Chat Completions 有两条落地路径，差别很大：
+
+- **尾部是用户消息**（普通对话）：状态追加在该消息正文之后。用户原文仍在最前，归属本来就清楚。
+- **尾部不是用户消息**（主动唤醒收尾于 assistant、或 tool result 收尾）：provider 不接受这两种角色收尾，因此只能另起一条 `user` 消息承载状态。这条消息必须带 `GATEWAY_ENVIRONMENT_ENVELOPE` 自报身份。
+
+第二条路径里的声明不是装饰。它缺席时，模型会把整条读成「这一轮用户说的话」，发现里面只有系统状态，于是推断「没有新消息、这轮是我的回合继续」，开始自己跟自己接话。回归用例见 `tests/gateway-adapters.test.mjs` 的 OA8–OA10：声明必须在状态正文之前；尾部是真实用户消息时不得出现声明；声明不得进账本的 `proofContext`，否则下一轮 replay 会把它贴到用户真实消息的末尾。
+
+Responses 走 `instructions`、Anthropic 走 `system`，两者本来就不占对话轮次，不需要声明。
+
 ## 注入与缓存
 
-动态 `[Proof 状态]` 默认追加在本轮输入末尾，以尽量保持 system 与既有历史前缀稳定。状态注入会增加输入 token，也可能影响 prompt cache；不同 provider 的缓存边界和计费规则不同，应以上游 `usage` 为准。
+状态注入会增加输入 token，也可能影响 prompt cache；不同 provider 的缓存边界和计费规则不同，应以上游 `usage` 为准。
 
 状态第一次出现、revision 变化、reset 或需要重新提醒时会产生新的动态输入。去重可以减少重复状态，不能让变化后的状态免费。
 
@@ -40,7 +51,7 @@ Gateway 每轮调用 `buildAgentTurnContext(engine, agentId, now)` 获取状态�
 Gateway 只能过滤实际经过它、并能由它重写的模型输入：
 
 - 客户端每轮提交完整 `messages` 或 `input` 时，可以执行硬过滤。
-- 使用上游托管历史、只提交 `previous_response_id` 等引用时，Gateway 无法删除上游已经保存的内容；默认拒绝，或在显式开启后降级为软断片。
+- 使用上游托管历史、只提交 `previous_response_id` 等引用时，Gateway 无法删除上游已经保存的内容；默认拒绍，或在显式开启后降级为软断片。
 - 原始历史仍在客户端输入中时，恢复阶段可以按允许的清晰度取回对应片段。
 - 原始历史已被宿主压缩或删除时，只能使用 Proof 留下的低分辨率事实。
 
