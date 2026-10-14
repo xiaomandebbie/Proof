@@ -8,7 +8,8 @@ import {
   buildOpenAiResponsesBody,
   buildAnthropicBody,
   openAiResponsesManaged,
-  AGENT_STATE_USE_POLICY
+  AGENT_STATE_USE_POLICY,
+  GATEWAY_ENVIRONMENT_ENVELOPE
 } from '../gateway/adapters.mjs';
 import { freshEngine, openBlackout, pushOnly, T0, H } from './lib/gatewayEngine.mjs';
 import { makeTempDir, removeTempDir } from './lib/gatewayEnv.mjs';
@@ -216,5 +217,114 @@ test('OA7 Anthropic 无断片透传：system blocks/multimodal 原样保留', as
     assert.equal(out.max_tokens, 128);
     assert.equal(out.x_meta, 42);
     assert.ok(Array.isArray(out.system));
+  });
+});
+
+// 主动唤醒（尾部是 assistant 自己上一条）是真实跳过 OA2 那条路径的场景。
+// provider 不接受 assistant 收尾，所以状态只能另起一条 user——但它必须说清楚
+// 自己不是 {{user}} 在说话。不说清楚的后果见 2026-10-14：模型判定「没有新用户
+// 消息、这轮是我的回合继续」，开始自己跟自己接话。
+test('OA8 Chat 主动唤醒：尾部非 user 时另起一条 user，必须带环境声明', async () => {
+  await withLedger(async ({ ledger }) => {
+    const engine = freshEngine();
+    pushOnly(engine, T0);
+    engine.setStateInjection(true);
+    const body = {
+      model: 'm',
+      messages: [
+        { role: 'system', content: 'sys' },
+        { role: 'user', content: '还早呢我一点睡' },
+        { role: 'assistant', content: '亲亲' }
+      ]
+    };
+    const { body: out, res } = await buildOpenAiChatBody({
+      engine, agentId: 'charb', now: T0 + 60_000, body, ledger, conversationId: 'wake1', requestId: 'w1'
+    });
+    assert.equal(res.injected, true);
+
+    const tail = out.messages.at(-1);
+    assert.equal(tail.role, 'user', 'provider 只接受 user 收尾');
+    assert.ok(tail.content.includes(GATEWAY_ENVIRONMENT_ENVELOPE), '凭空追加的 user 必须自报是环境');
+    assert.ok(tail.content.includes('[Proof 状态]'), '状态正文仍在');
+    assert.ok(
+      tail.content.indexOf(GATEWAY_ENVIRONMENT_ENVELOPE) < tail.content.indexOf('[Proof 状态]'),
+      '声明要在状态正文之前，否则模型已经当成她的话读了'
+    );
+    assert.ok(tail.content.includes('{{user}}'), '保持占位符，不写死称呼');
+
+    // 她那句真话和他自己那句一字不动
+    assert.deepEqual(out.messages[0], body.messages[0]);
+    assert.equal(out.messages[1].content, '还早呢我一点睡');
+    assert.equal(out.messages[2].content, '亲亲');
+    assert.equal(out.messages.length, 4, '只多一条，不动原有消息');
+  });
+});
+
+test('OA9 Chat 尾部是真实 user 时不得出现环境声明', async () => {
+  await withLedger(async ({ ledger }) => {
+    const engine = freshEngine();
+    pushOnly(engine, T0);
+    engine.setStateInjection(true);
+    const body = { model: 'm', messages: [{ role: 'system', content: 'sys' }, { role: 'user', content: '我回来了' }] };
+    const { body: out } = await buildOpenAiChatBody({
+      engine, agentId: 'charb', now: T0 + 60_000, body, ledger, conversationId: 'wake2', requestId: 'w2'
+    });
+    const tail = out.messages.at(-1);
+    assert.ok(tail.content.startsWith('我回来了\n'), '她的原文仍在最前');
+    assert.ok(tail.content.includes('[Proof 状态]'));
+    assert.equal(
+      tail.content.includes(GATEWAY_ENVIRONMENT_ENVELOPE),
+      false,
+      '她真的在说话，说「以下不是 {{user}} 的发言」就是假话'
+    );
+    assert.equal(out.messages.length, 2, '不额外追加消息');
+  });
+});
+
+test('OA10 envelope 不得进 ledger 的 proofContext（否则下轮 replay 贴到她话后面）', async () => {
+  await withLedger(async ({ ledger }) => {
+    const engine = freshEngine();
+    pushOnly(engine, T0);
+    engine.setStateInjection(true);
+
+    // 第一轮：主动唤醒，尾部 assistant → 走 envelope 分支
+    const first = {
+      model: 'm',
+      messages: [
+        { role: 'user', content: '先复习啦～' },
+        { role: 'assistant', content: '亲亲' }
+      ]
+    };
+    await buildOpenAiChatBody({
+      engine, agentId: 'charb', now: T0 + 60_000, body: first, ledger, conversationId: 'wake3', requestId: 'w3'
+    });
+
+    const latest = await ledger.latestProofContext('charb', 'wake3');
+    if (latest?.proofContext) {
+      assert.equal(
+        latest.proofContext.includes(GATEWAY_ENVIRONMENT_ENVELOPE),
+        false,
+        'envelope 是投递形式，不是该沉淀进历史的状态快照'
+      );
+    }
+
+    // 第二轮：她真的开口了。历史里不得出现「以下不是 {{user}} 的发言」
+    const second = {
+      model: 'm',
+      messages: [
+        ...first.messages,
+        { role: 'user', content: '醒了' }
+      ]
+    };
+    const { body: out } = await buildOpenAiChatBody({
+      engine, agentId: 'charb', now: T0 + 60_000, body: second, ledger, conversationId: 'wake3', requestId: 'w4'
+    });
+    const replayed = JSON.stringify(out.messages);
+    assert.equal(
+      replayed.includes(GATEWAY_ENVIRONMENT_ENVELOPE),
+      false,
+      'envelope 不得被 replay 贴回历史消息'
+    );
+    assert.equal(out.messages.at(-1).content.includes('醒了'), true);
   });
 });
